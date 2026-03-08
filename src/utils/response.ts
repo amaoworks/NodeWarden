@@ -54,6 +54,7 @@ function buildCorsHeaders(request: Request): Record<string, string> {
   const allowedOrigin = getAllowedOrigin(request);
   if (allowedOrigin) {
     headers['Access-Control-Allow-Origin'] = allowedOrigin;
+    headers['Access-Control-Allow-Credentials'] = 'true';
     headers['Vary'] = 'Origin';
   }
 

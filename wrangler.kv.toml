@@ -23,4 +23,4 @@ binding = "ATTACHMENTS_KV"
 
 [[migrations]]
 tag = "v1-notifications-hub"
-new_sqlite_classes = ["NotificationsHub"]
+new_sqlite_classes = [ "NotificationsHub" ]
