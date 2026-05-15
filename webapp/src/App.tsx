@@ -22,7 +22,7 @@ import {
   saveSession,
   stripProfileSecrets,
 } from '@/lib/api/auth';
-import { listAdminInvites, listAdminUsers } from '@/lib/api/admin';
+import { clearAuditLogs, getAuditLogSettings, listAdminInvites, listAdminUsers, listAuditLogs, saveAuditLogSettings, type AuditLogFilters } from '@/lib/api/admin';
 import { getDomainRules, saveDomainRules } from '@/lib/api/domains';
 import { getSends } from '@/lib/api/send';
 import { getCachedVaultCoreSnapshot, loadVaultCoreSyncSnapshot } from '@/lib/api/vault-sync';
@@ -69,7 +69,7 @@ import {
   createDemoMainRoutesProps,
 } from '@/lib/demo';
 import type { AdminBackupSettings } from '@/lib/api/backup';
-import type { AdminInvite, AdminUser, AppPhase, AuthorizedDevice, Cipher, CustomEquivalentDomain, DomainRules, Folder as VaultFolder, Profile, Send, SessionState } from '@/lib/types';
+import type { AdminInvite, AdminUser, AppPhase, AuditLogSettings, AuthorizedDevice, Cipher, CustomEquivalentDomain, DomainRules, Folder as VaultFolder, Profile, Send, SessionState } from '@/lib/types';
 import type { VaultCoreSnapshot } from '@/lib/vault-cache';
 
 function isBackupProgressDetail(value: unknown): value is BackupProgressDetail {
@@ -96,6 +96,7 @@ const APP_ROUTE_PATHS = [
   '/vault/totp',
   '/sends',
   '/admin',
+  '/logs',
   '/security/devices',
   '/backup',
   '/settings',
@@ -171,6 +172,7 @@ export default function App() {
   const [session, setSessionState] = useState<SessionState | null>(initialBootstrap.session);
   const [profile, setProfile] = useState<Profile | null>(initialProfileSnapshot);
   const [defaultKdfIterations, setDefaultKdfIterations] = useState(initialBootstrap.defaultKdfIterations);
+  const [registrationInviteRequired, setRegistrationInviteRequired] = useState(initialBootstrap.registrationInviteRequired);
   const [jwtWarning, setJwtWarning] = useState<{ reason: JwtUnsafeReason; minLength: number } | null>(initialBootstrap.jwtWarning);
 
   const [loginValues, setLoginValues] = useState({ email: '', password: '' });
@@ -231,6 +233,8 @@ export default function App() {
   const pendingVaultCoreRefreshRef = useRef<Promise<unknown> | null>(null);
   const notificationRefreshTimerRef = useRef<number | null>(null);
   const domainRulesSaveSeqRef = useRef(0);
+  const loginEmailRef = useRef(loginValues.email);
+  const loginHintRequestSeqRef = useRef(0);
   const { toasts, pushToast, removeToast } = useToastManager();
 
   useEffect(() => {
@@ -263,6 +267,7 @@ export default function App() {
   }, [inviteCodeFromUrl]);
 
   useEffect(() => {
+    loginEmailRef.current = loginValues.email;
     const normalizedEmail = loginValues.email.trim().toLowerCase();
     setLoginHintState((prev) => (
       prev.email && prev.email !== normalizedEmail
@@ -410,6 +415,7 @@ export default function App() {
       const normalizedCurrentHashPath = currentHashPath.replace(/^\/+/, '').replace(/\/+$/, '');
       const isDemoPublicSendRoute = /^send\/[^/]+(?:\/[^/]+)?$/i.test(normalizedCurrentHashPath);
       setDefaultKdfIterations(initialBootstrap.defaultKdfIterations);
+      setRegistrationInviteRequired(initialBootstrap.registrationInviteRequired);
       setJwtWarning(null);
       setSession(null);
       setProfile(null);
@@ -424,6 +430,7 @@ export default function App() {
       const boot = await bootstrapAppSession(initialBootstrap);
       if (!mounted) return;
       setDefaultKdfIterations(boot.defaultKdfIterations);
+      setRegistrationInviteRequired(boot.registrationInviteRequired);
       setJwtWarning(boot.jwtWarning);
       setSession(boot.session);
       setProfile(boot.profile);
@@ -634,6 +641,7 @@ export default function App() {
       return;
     }
 
+    const requestSeq = ++loginHintRequestSeqRef.current;
     setLoginHintState({
       email,
       loading: true,
@@ -642,6 +650,7 @@ export default function App() {
 
     try {
       const result = await getPasswordHint(email);
+      if (loginHintRequestSeqRef.current !== requestSeq || loginEmailRef.current.trim().toLowerCase() !== email) return;
       openPasswordHintDialog(result.masterPasswordHint);
       setLoginHintState({
         email,
@@ -649,6 +658,7 @@ export default function App() {
         hint: result.masterPasswordHint,
       });
     } catch (error) {
+      if (loginHintRequestSeqRef.current !== requestSeq || loginEmailRef.current.trim().toLowerCase() !== email) return;
       setLoginHintState({
         email: '',
         loading: false,
@@ -1389,6 +1399,7 @@ export default function App() {
     if (location === '/vault/totp') return t('txt_verification_code');
     if (location === '/sends') return t('nav_sends');
     if (location === '/admin') return t('nav_admin_panel');
+    if (location === '/logs') return t('nav_log_center');
     if (location === '/security/devices') return t('nav_device_management');
     if (location === SETTINGS_DOMAIN_RULES_ROUTE) return t('nav_domain_rules');
     if (location === '/backup') return t('nav_backup_strategy');
@@ -1403,13 +1414,19 @@ export default function App() {
   }, [phase, location, isPublicSendRoute, navigate]);
 
   useEffect(() => {
+    if (phase === 'register' && (location === '/' || location === '/login') && !isPublicSendRoute) {
+      navigate('/register');
+    }
+  }, [phase, location, isPublicSendRoute, navigate]);
+
+  useEffect(() => {
     if (phase === 'app' && isImportHashRoute && location !== IMPORT_ROUTE) {
       navigate(IMPORT_ROUTE);
     }
   }, [phase, isImportHashRoute, location, navigate]);
 
   useEffect(() => {
-    if (phase === 'app' && !isAdminProfile(profile) && location === '/backup' && !profileQuery.isFetching) {
+    if (phase === 'app' && !isAdminProfile(profile) && (location === '/backup' || location === '/logs') && !profileQuery.isFetching) {
       navigate('/vault');
     }
   }, [phase, profile?.role, profileQuery.isFetching, location, navigate]);
@@ -1460,6 +1477,7 @@ export default function App() {
     onDeleteVaultItem: vaultSendActions.deleteVaultItem,
     onArchiveVaultItem: vaultSendActions.archiveVaultItem,
     onUnarchiveVaultItem: vaultSendActions.unarchiveVaultItem,
+    onRestoreVaultItems: vaultSendActions.bulkRestoreVaultItems,
     onBulkDeleteVaultItems: vaultSendActions.bulkDeleteVaultItems,
     onBulkPermanentDeleteVaultItems: vaultSendActions.bulkPermanentDeleteVaultItems,
     onBulkRestoreVaultItems: vaultSendActions.bulkRestoreVaultItems,
@@ -1502,6 +1520,7 @@ export default function App() {
     onSaveDomainRules: handleSaveDomainRules,
     onRenameAuthorizedDevice: accountSecurityActions.renameAuthorizedDevice,
     onRevokeDeviceTrust: accountSecurityActions.openRevokeDeviceTrust,
+    onTrustDevicePermanently: accountSecurityActions.openTrustDevicePermanently,
     onRemoveDevice: accountSecurityActions.openRemoveDevice,
     onRevokeAllDeviceTrust: accountSecurityActions.openRevokeAllDeviceTrust,
     onRemoveAllDevices: accountSecurityActions.openRemoveAllDevices,
@@ -1511,6 +1530,10 @@ export default function App() {
     onToggleUserStatus: adminActions.toggleUserStatus,
     onDeleteUser: adminActions.deleteUser,
     onRevokeInvite: adminActions.revokeInvite,
+    onLoadAuditLogs: (filters: AuditLogFilters) => listAuditLogs(authedFetch, filters),
+    onLoadAuditLogSettings: () => getAuditLogSettings(authedFetch),
+    onSaveAuditLogSettings: (settings: AuditLogSettings) => saveAuditLogSettings(authedFetch, settings),
+    onClearAuditLogs: () => clearAuditLogs(authedFetch),
     onExportBackup: backupActions.exportBackup,
     onImportBackup: backupActions.importBackup,
     onImportBackupAllowingChecksumMismatch: backupActions.importBackupAllowingChecksumMismatch,
@@ -1599,6 +1622,7 @@ export default function App() {
           unlockPreparing={unlockPreparing}
           loginValues={loginValues}
           registerValues={registerValues}
+          registrationInviteRequired={registrationInviteRequired}
           unlockPassword={unlockPassword}
           emailForLock={profile?.email || session?.email || ''}
           loginHintLoading={loginHintState.loading}
