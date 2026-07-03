@@ -290,7 +290,7 @@ export interface ListResponse<T> {
 
 export interface WebBootstrapResponse {
   defaultKdfIterations?: number;
-  jwtUnsafeReason?: 'missing' | 'default' | 'too_short' | null;
+  jwtUnsafeReason?: 'missing' | 'too_short' | null;
   jwtSecretMinLength?: number;
   registrationInviteRequired?: boolean;
 }
@@ -314,6 +314,8 @@ export interface TokenSuccess {
   ResetMasterPassword?: boolean;
   scope?: string;
   unofficialServer?: boolean;
+  UserVerificationToken?: string;
+  userVerificationToken?: string;
   UserDecryptionOptions?: unknown;
   userDecryptionOptions?: unknown;
   VaultKeys?: {

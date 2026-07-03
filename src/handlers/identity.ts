@@ -4,12 +4,13 @@ import { AuthService } from '../services/auth';
 import { RateLimitService, getClientIdentifier } from '../services/ratelimit';
 import { jsonResponse, errorResponse, identityErrorResponse } from '../utils/response';
 import { LIMITS } from '../config/limits';
-import { isTotpEnabled, verifyTotpToken } from '../utils/totp';
+import { findMatchingTotpCounter, isTotpEnabled } from '../utils/totp';
 import { createRefreshToken } from '../utils/jwt';
 import { readAuthRequestDeviceInfo } from '../utils/device';
 import { createRecoveryCode, recoveryCodeEquals } from '../utils/recovery-code';
 import { generateUUID } from '../utils/uuid';
 import { issueSendAccessToken } from './sends';
+import { registerMobilePushDevice } from '../services/push-relay';
 import {
   buildAccountKeys,
   buildUserDecryptionOptions,
@@ -20,6 +21,8 @@ import {
   buildAccountPasskeyTokenUserDecryptionOption,
 } from './account-passkeys';
 import { isAuthRequestExpired } from '../services/storage-auth-request-repo';
+import { createPasskeyUserVerificationToken } from '../utils/user-verification-token';
+import { constantTimeEquals, verifyApiKey } from '../utils/api-key';
 
 const TWO_FACTOR_REMEMBER_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const TWO_FACTOR_PROVIDER_AUTHENTICATOR = 0;
@@ -50,6 +53,44 @@ async function resolveDeviceSession(
   return { identifier: deviceInfo.deviceIdentifier, sessionStamp };
 }
 
+function readDevicePushToken(body: Record<string, string>): string {
+  return String(readBodyValue(body, ['devicePushToken', 'DevicePushToken', 'device_push_token']) || '').trim();
+}
+
+async function persistIdentityDevicePushToken(
+  env: Env,
+  storage: StorageService,
+  userId: string,
+  deviceSession: { identifier: string; sessionStamp: string } | null,
+  deviceType: number,
+  body: Record<string, string>
+): Promise<void> {
+  if (!deviceSession) return;
+  const pushToken = readDevicePushToken(body);
+  if (!pushToken) return;
+
+  const device = await storage.getDevice(userId, deviceSession.identifier);
+  if (!device) return;
+
+  const pushUuid = device.pushUuid || generateUUID();
+  await storage.updateDevicePushToken(userId, deviceSession.identifier, pushUuid, pushToken);
+  const registered = await registerMobilePushDevice(env, {
+    userId,
+    deviceIdentifier: deviceSession.identifier,
+    type: device.type || deviceType,
+    pushUuid,
+    pushToken,
+  });
+  console.info('Mobile push token updated from identity token request', {
+    userId,
+    deviceIdentifier: deviceSession.identifier,
+    deviceType: device.type || deviceType,
+    pushUuid,
+    pushTokenLength: pushToken.length,
+    relayRegistered: registered,
+  });
+}
+
 function shouldUseWebSession(request: Request): boolean {
   return String(request.headers.get('X-NodeWarden-Web-Session') || '').trim() === '1';
 }
@@ -64,18 +105,6 @@ function parseCookieValue(request: Request, name: string): string | null {
     return value ? decodeURIComponent(value) : null;
   }
   return null;
-}
-
-function constantTimeEquals(a: string, b: string): boolean {
-  const encA = new TextEncoder().encode(a);
-  const encB = new TextEncoder().encode(b);
-  if (encA.length !== encB.length) return false;
-
-  let diff = 0;
-  for (let i = 0; i < encA.length; i++) {
-    diff |= encA[i] ^ encB[i];
-  }
-  return diff === 0;
 }
 
 function readBodyValue(body: Record<string, string>, names: string[]): string | undefined {
@@ -140,6 +169,20 @@ function buildPreloginResponse(
   };
 }
 
+function masterPasswordPolicyResponse(): TokenResponse['MasterPasswordPolicy'] {
+  return {
+    minComplexity: 0,
+    minLength: 0,
+    requireUpper: false,
+    requireLower: false,
+    requireNumbers: false,
+    requireSpecial: false,
+    enforceOnLogin: false,
+    Object: 'masterPasswordPolicy',
+    object: 'masterPasswordPolicy',
+  };
+}
+
 function twoFactorRequiredResponse(message: string = 'Two factor required.'): Response {
   // Match Bitwarden Identity: TwoFactorProviders2 lists enabled 2FA providers only.
   // Clients expose recovery-code entry points themselves; Android 2026.4 fails to
@@ -151,9 +194,7 @@ function twoFactorRequiredResponse(message: string = 'Two factor required.'): Re
     TwoFactorProviders: providers,
     TwoFactorProviders2: providers2,
     SsoEmail2faSessionToken: null,
-    MasterPasswordPolicy: {
-      Object: 'masterPasswordPolicy',
-    },
+    MasterPasswordPolicy: masterPasswordPolicyResponse(),
   };
 
   // Bitwarden clients rely on these fields to trigger the 2FA UI flow.
@@ -285,10 +326,11 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
     }
 
     let validatedAuthRequestId: string | null = null;
+    let authRequestLoginKey: string | null = null;
     let valid = false;
     const normalizedAuthRequestId = String(authRequestId || '').trim();
     if (normalizedAuthRequestId) {
-      const authRequest = await storage.getAuthRequestById(normalizedAuthRequestId);
+      const authRequest = await storage.getAuthRequestByIdForUser(normalizedAuthRequestId, user.id);
       valid = !!(
         authRequest &&
         authRequest.userId === user.id &&
@@ -297,10 +339,12 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
         authRequest.responseDate &&
         !authRequest.authenticationDate &&
         !isAuthRequestExpired(authRequest) &&
+        !!authRequest.key &&
         constantTimeEquals(authRequest.accessCode, passwordHash)
       );
       if (valid) {
         validatedAuthRequestId = authRequest!.id;
+        authRequestLoginKey = authRequest!.key;
       }
     } else {
       valid = await auth.verifyPassword(passwordHash, user.masterPasswordHash, user.email);
@@ -357,8 +401,12 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
           return twoFactorRequiredResponse('Two factor required.');
         }
       } else if (normalizedTwoFactorProvider === String(TWO_FACTOR_PROVIDER_AUTHENTICATOR)) {
-        const totpOk = await verifyTotpToken(effectiveTotpSecret, normalizedTwoFactorToken);
-        if (!totpOk) {
+        const matchedCounter = await findMatchingTotpCounter(effectiveTotpSecret, normalizedTwoFactorToken);
+        if (matchedCounter == null) {
+          return recordFailedTwoFactorAndBuildResponse(rateLimit, loginIdentifier);
+        }
+        const consumed = await storage.consumeTotpLoginCounter(user.id, matchedCounter);
+        if (!consumed) {
           return recordFailedTwoFactorAndBuildResponse(rateLimit, loginIdentifier);
         }
       } else if (
@@ -371,9 +419,11 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
         }
         user.totpSecret = null;
         user.totpRecoveryCode = createRecoveryCode();
+        user.securityStamp = generateUUID();
         user.updatedAt = new Date().toISOString();
         await storage.saveUser(user);
         await storage.deleteRefreshTokensByUserId(user.id);
+        AuthService.invalidateUserCache(user.id);
         rememberRequested = false;
       } else {
         // Unsupported provider for this server profile behaves as an invalid 2FA attempt.
@@ -402,6 +452,7 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
         deviceInfo.deviceType,
         deviceSession.sessionStamp
       );
+      await persistIdentityDevicePushToken(env, storage, user.id, deviceSession, deviceInfo.deviceType, body);
     }
 
     // Successful login - clear failed attempts
@@ -436,7 +487,7 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
       token_type: 'Bearer',
       ...(shouldUseWebSession(request) ? { web_session: true } : { refresh_token: refreshToken }),
       ...(trustedTwoFactorTokenToReturn ? { TwoFactorToken: trustedTwoFactorTokenToReturn } : {}),
-      Key: user.key,
+      Key: authRequestLoginKey || user.key,
       PrivateKey: user.privateKey,
       AccountKeys: accountKeys,
       accountKeys: accountKeys,
@@ -446,9 +497,7 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
       KdfParallelism: user.kdfParallelism,
       ForcePasswordReset: false,
       ResetMasterPassword: false,
-      MasterPasswordPolicy: {
-        Object: 'masterPasswordPolicy',
-      },
+      MasterPasswordPolicy: masterPasswordPolicyResponse(),
       ApiUseKeyConnector: false,
       scope: 'api offline_access',
       unofficialServer: true,
@@ -526,12 +575,14 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
         deviceInfo.deviceType,
         deviceSession.sessionStamp
       );
+      await persistIdentityDevicePushToken(env, storage, user.id, deviceSession, deviceInfo.deviceType, body);
     }
 
     await rateLimit.clearLoginAttempts(loginIdentifier);
 
     const accessToken = await auth.generateAccessToken(user, deviceSession);
     const refreshToken = await auth.generateRefreshToken(user.id, deviceSession);
+    const userVerificationToken = await createPasskeyUserVerificationToken(env, user.id, 'backup.settings.repair');
     const accountKeys = buildAccountKeys(user);
     const webAuthnPrfOption = buildAccountPasskeyTokenUserDecryptionOption(credential);
     const userDecryptionOptions = buildUserDecryptionOptions(user, webAuthnPrfOption);
@@ -566,12 +617,12 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
       KdfParallelism: user.kdfParallelism,
       ForcePasswordReset: false,
       ResetMasterPassword: false,
-      MasterPasswordPolicy: {
-        Object: 'masterPasswordPolicy',
-      },
+      MasterPasswordPolicy: masterPasswordPolicyResponse(),
       ApiUseKeyConnector: false,
       scope: 'api offline_access',
       unofficialServer: true,
+      UserVerificationToken: userVerificationToken,
+      userVerificationToken,
       UserDecryptionOptions: userDecryptionOptions,
       userDecryptionOptions: userDecryptionOptions,
     };
@@ -628,7 +679,7 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
       return identityErrorResponse('Account is disabled', 'invalid_grant', 400);
     }
 
-    if (!user.apiKey || !constantTimeEquals(clientSecret, user.apiKey)) {
+    if (!user.apiKey || !(await verifyApiKey(clientSecret, user.apiKey))) {
       await rateLimit.recordFailedLogin(loginIdentifier);
       await safeWriteAuditEvent(env, {
         actorUserId: user.id,
@@ -656,6 +707,7 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
         deviceInfo.deviceType,
         deviceSession.sessionStamp
       );
+      await persistIdentityDevicePushToken(env, storage, user.id, deviceSession, deviceInfo.deviceType, body);
     }
 
     // Successful login - clear failed attempts
@@ -696,9 +748,7 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
       KdfParallelism: user.kdfParallelism,
       ForcePasswordReset: false,
       ResetMasterPassword: false,
-      MasterPasswordPolicy: {
-        Object: 'masterPasswordPolicy',
-      },
+      MasterPasswordPolicy: masterPasswordPolicyResponse(),
       ApiUseKeyConnector: false,
       scope: 'api offline_access',
       unofficialServer: true,
@@ -836,9 +886,7 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
       KdfParallelism: user.kdfParallelism,
       ForcePasswordReset: false,
       ResetMasterPassword: false,
-      MasterPasswordPolicy: {
-        Object: 'masterPasswordPolicy',
-      },
+      MasterPasswordPolicy: masterPasswordPolicyResponse(),
       ApiUseKeyConnector: false,
       scope: 'api offline_access',
       unofficialServer: true,
